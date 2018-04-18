@@ -12,7 +12,9 @@ import random
 import os
 import re
 
-from Database import add_stock_ticks, add_headlines, clean_ticks
+import yqd
+
+from Database import add_stock_ticks, add_headlines, clean_ticks, db
 
 
 # In[2]:
@@ -36,9 +38,32 @@ def consume_ticker_csv(stock, filename):
     
     clean_ticks()
 
+def dl_ticker(stock, num_days=10):
+    """Loads data from yahoo"""
+    entries = []
+    
+    end_date = datetime.today()
+    begin_date = end_date - timedelta(days=num_days)
+    
+    for line in yqd.load_yahoo_quote(stock, begin_date.strftime('%Y%m%d'), end_date.strftime('%Y%m%d')):
+        
+        if "Date" not in line and len(line) > 1:
+                
+                date, open_, high, low, close, adj_close, volume = line.split(',')
+                
+                entries.append((stock, date, open_, high, low, close, adj_close, volume))
+                
+    add_stock_ticks(entries)
+    
+    clean_ticks()
+    
+
 
 # In[3]:
 
+
+def basic_clean(text):
+    return text.strip().replace("&#39;", "'").replace("&quot;", "").replace("&amp;", "and").replace("(TM)", "")
 
 def get_reddit_news(subs, search_terms, limit=None, praw_config='StockMarketML'):
     "Get headlines from Reddit"
@@ -189,7 +214,7 @@ def get_seekingalpha_news(stock, pages=500):
 
     return articles
 
-def get_fool_news(stock, pages=30):
+def get_fool_news(stock, pages=40):
     "Get headlines from Motley Fool"
     print('Downloading MotleyFool: ' + stock)
     
@@ -206,24 +231,101 @@ def get_fool_news(stock, pages=30):
         else:
             url = "https://www.fool.com/quote/nasdaq/apple/{}/content/more?page={}".format(stock, i)
             
-        text = requests.get(url).text
+        try:
+            
+            text = requests.get(url).text
+            
+        except: # Timeout or something...
+            
+            pass
         
         headlines = [(match.group(1), match.group(2)) for match in re_headline.finditer(text)]
         
         for headline, date in headlines:
             
             date = datetime.strptime(date.strip(), "%b %d %Y")
-            headline = headline.strip().replace("&#39;", "'").replace("&quot;", "")
+            headline = basic_clean(headline)
             
             articles[date.strftime('%Y-%m-%d')].append(headline)
             
+    return articles
+
+def get_wsj(stock, pages=20):
+    "Get headlines from WSJ"
+    print('Downloading WSJ: ' + stock)
+    
+    re_headline = re.compile('<li class="\s+cr_pressRelease">[\s\S]+?"cr_dateStamp">([\s\S]+?)<\/li>[\s\S]+?href="http:\/\/www.wsj.com\/articles\S+?>([\s\S]+?)<\/a>')
+    re_nextlink = re.compile('article_datetime" value="?(\d+\/\d+\/\d+)"?>[\s\S]+?article_docId" value="?(\d+)"?>[\s\S]+?newswire_datetime" value="?(\d+\/\d+\/\d+)"?>[\s\S]+?newswire_docId" value="?(\d+)"?>[\s\S]+?')
+    
+    url = "http://quotes.wsj.com/ajax/overview/5/US/{}?instrumentType=STOCK&significant=false".format(stock)
+    
+    articles = defaultdict(list)
+    
+    for i in range(pages):
+        
+        text = requests.get(url).text
+        
+        headlines = [(match.group(1), match.group(2)) for match in re_headline.finditer(text)]
+        
+        for date, headline in headlines:
+            
+            try:
+                date = datetime.strptime(date.strip(), "%m/%d/%y")
+            except:
+                date = datetime.today()
+                
+            headline = basic_clean(headline)
+            
+            articles[date.strftime('%Y-%m-%d')].append(headline)
+            
+        nextpage_creds = re_nextlink.search(text)
+        
+        if nextpage_creds:
+            
+            nextpage_creds = [nextpage_creds.group(1), nextpage_creds.group(2), nextpage_creds.group(3), nextpage_creds.group(4)]
+            url = "http://quotes.wsj.com/ajax/overview/5/US/{}?instrumentType=STOCK&significant=false&article_datetime={}&article_docId={}&newswire_datetime={}&newswire_docId={}".format(stock, *nextpage_creds)
+        
+        else:
+            
+            break
+            
+    return articles
+
+def get_thestreet(stock, pages=60):
+    "Get headlines from TheStreet"
+    print('Downloading TheStreet: ' + stock)
+    
+    url = "https://www.thestreet.com/quote/{}/details/news?start=0&type=json".format(stock)
+    
+    articles = defaultdict(list)
+    
+    for i in range(pages):
+    
+        try:
+            json = requests.get(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.84 Safari/537.36'}).json()
+        except:
+            break
+        
+        for story in json['stories']:
+            
+            if 'headline' and 'callout' in story and story['headline'] and story['callout']:
+            
+                headline = basic_clean(story['headline'])
+                callout = basic_clean(story['callout'])
+                date = datetime.strptime(story['publishDate'], "%Y-%m-%dT%H:%M:%SZ")
+
+                articles[date.strftime('%Y-%m-%d')].append(headline)
+                articles[date.strftime('%Y-%m-%d')].append(callout)
+            
+        url = "https://www.thestreet.com" + json['pagination']['nextDataUrl']
+        
     return articles
 
 
 # In[4]:
 
 
-def clean_headline(headline, replacements={}):
+def clean_headline(headline, dictionary):
     """
     Clean headline
     
@@ -231,11 +333,13 @@ def clean_headline(headline, replacements={}):
     """
     headline = headline.lower()
     headline = re.sub('\d+%', 'STAT', headline)
+    headline = re.sub('\b\d+\b', 'STAT', headline)
     headline = ''.join(c for c in headline if c in "abcdefghijklmnopqrstuvwxyz ")
     headline = re.sub('\s+', ' ', headline)
-    
-    for original, replacement in replacements.items():
-        headline = headline.replace(original, replacement)
+        
+    for (word, replacement) in dictionary:
+            
+        headline = headline.replace(word, replacement)
         
     headline = headline.replace('STAT', '**STATISTIC**')
         
@@ -247,12 +351,17 @@ def clean_headline(headline, replacements={}):
 # In[5]:
 
 
-def save_headlines(headlines, kword_replacements={}):
+def save_headlines(headlines):
     """Save headlines to file"""
     
     for stock in headlines:
         
         entries = []
+        
+        with db() as (conn, cur):
+        
+            cur.execute("SELECT word, replacement FROM dictionary WHERE stock=? ORDER BY LENGTH(word) DESC", [stock])
+            dictionary = cur.fetchall()
         
         for source in headlines[stock]:
             
@@ -260,9 +369,9 @@ def save_headlines(headlines, kword_replacements={}):
                 
                 for headline in headlines[stock][source][date]:
                     
-                    headline = clean_headline(headline, kword_replacements[stock])
+                    cleaned_headline = clean_headline(headline, dictionary)
                     
-                    entries.append((stock, date, source, headline))
+                    entries.append((stock, date, source, cleaned_headline, headline, -999))
                     
         add_headlines(entries)
     
@@ -279,105 +388,55 @@ if __name__ == "__main__":
                 'reuters': get_reuters_news('GOOG.O'),
                 'twitter': get_twitter_news(['@Google', '#Google', '#googlepixel', '#Alphabet']),
                 'seekingalpha': get_seekingalpha_news('GOOG'),
-                'fool': get_fool_news('GOOG')
+                'fool': get_fool_news('GOOG'),
+                'wsj': get_wsj('GOOG'),
+                'thestreet': get_thestreet('GOOG')
             },
             'AAPL': {
                 'reddit': get_reddit_news(['apple', 'ios', 'AAPL', 'news'], ['apple', 'iphone', 'ipad', 'ios', 'stock']), 
                 'reuters': get_reuters_news('AAPL.O'),
                 'twitter': get_twitter_news(['@Apple', '#Apple', '#IPhone', '#ios']),
                 'seekingalpha': get_seekingalpha_news('AAPL'),
-                'fool': get_fool_news('AAPL')
+                'fool': get_fool_news('AAPL'),
+                'wsj': get_wsj('AAPL'),
+                'thestreet': get_thestreet('AAPL')
             },
             'MSFT': {
                 'reddit': get_reddit_news(['microsoft', 'windowsphone', 'windows'], ['microsoft', 'phone', 'windows', 'stock']), 
                 'reuters': get_reuters_news('MSFT.O'),
                 'twitter': get_twitter_news(['@Microsoft', '#Windows', '#Microsoft', '#windowsphone']),
                 'seekingalpha': get_seekingalpha_news('MSFT'),
-                'fool': get_fool_news('MSFT')
+                'fool': get_fool_news('MSFT'),
+                'wsj': get_wsj('MSFT'),
+                'thestreet': get_thestreet('MSFT')
             },
             'AMD': {
                 'reddit': get_reddit_news(['Amd', 'AMD_Stock', 'pcmasterrace'], ['AMD', 'radeon', 'ryzen', 'stock']), 
                 'reuters': get_reuters_news('AMD.O'),
                 'twitter': get_twitter_news(['@AMD', '#AMD', '#Ryzen', '#radeon']),
                 'seekingalpha': get_seekingalpha_news('AMD'),
-                'fool': get_fool_news('AMD')
+                'fool': get_fool_news('AMD'),
+                'wsj': get_wsj('AMD'),
+                'thestreet': get_thestreet('AMD')
             },
             'AMZN': {
                 'reddit': get_reddit_news(['amazon', 'amazonprime', 'amazonecho'], ['amazon', 'echo', 'prime', 'stock']), 
                 'reuters': get_reuters_news('AMZN.O'),
                 'twitter': get_twitter_news(['@amazon', '#Amazon', '#jeffbezos', '@amazonecho', '#amazonprime']),
                 'seekingalpha': get_seekingalpha_news('AMZN'),
-                'fool': get_fool_news('AMZN')
+                'fool': get_fool_news('AMZN'),
+                'wsj': get_wsj('AMZN'),
+                'thestreet': get_thestreet('AMZN')
+            },
+            'INTC': {
+                'reddit': get_reddit_news(['intel', 'hardware'], ['intel', 'cpu']),
+                'reuters': get_reuters_news('INTC.O'),
+                'twitter': get_twitter_news(['@intel']),
+                'seekingalpha': get_seekingalpha_news('INTC'),
+                'fool': get_fool_news('INTC'),
+                'wsj': get_wsj('INTC'),
+                'thestreet': get_thestreet('INTC')
             }
-    }
-    
-    kword_replacements = { # To futher generalize headlines
-        'GOOG': {
-            'googleplay': '**PRODUCT**',
-            'googlemusic': '**PRODUCT**',
-            'googlehome': '**PRODUCT**',
-            'googlephotos': '**PRODUCT**',
-            'google': '**COMPANY**',
-            'alphabet': '**COMPANY**',
-            'androidpay': '**PRODUCT**',
-            'android': '**PRODUCT**',
-            'pixelxl': '**PRODUCT**',
-            'pixel': '**PRODUCT**',
-            'maps': '**PRODUCT**',
-            'youtube': '**PRODUCT**',
-            'chromecast': '**PRODUCT**',
-            'nexusx': '**PRODUCT**',
-            'nexusp': '**PRODUCT**',
-            'nexus': '**PRODUCT**',
-            'googletranslate': '**PRODUCT**',
-            'gboard': '**PRODUCT**',
-            'materialdesign': '**PRODUCT**',
-            'alphago': '**PRODUCT**'
-        },
-        'AAPL': {
-            'applemusic': '**PRODUCT**',
-            'applepay': '**PRODUCT**',
-            'appletv': '**PRODUCT**',
-            'apple': '**COMPANY**', 
-            'macbook': '**PRODUCT**',
-            'iphone x': '**PRODUCT**',
-            'iphonex': '**PRODUCT**',
-            'iphone': '**PRODUCT**',
-            'ipad': '**PRODUCT**',
-            'ios': '**PRODUCT**',
-            'icloud': '**PRODUCT**',
-            'faceid': '**PRODUCT**',
-            'airpods': '**PRODUCT**',
-            'animoji': '**PRODUCT**',
-            'lightningpin': '**PRODUCT**',
-            'touchid': '**PRODUCT**'
-        },
-        'MSFT': {
-            'microsoft': '**COMPANY**',
-            'windows': '**PRODUCT**',
-            'onedrive': '**PRODUCT**',
-            'outlook': '**PRODUCT**',
-            'bing': '**PRODUCT**'
-        },
-        'AMD': {
-            'amd': '**COMPANY**',
-            'ryzen': '**PRODUCT**',
-            'radeon': '**PRODUCT**',
-            'rxvega': '**PRODUCT**'
-        },
-        'AMZN': {
-            'amazonfire':'**PRODUCT**',
-            'amazon': '**COMPANY**',
-            'echo': '**PRODUCT**',
-            'prime': '**PRODUCT**',
-            'alexa': '**PRODUCT**',
-            'firetv': '**PRODUCT**',
-            'amazonvisa': '**PRODUCT**',
-            'amazondot': '**PRODUCT**',
-            'dot': '**PRODUCT**',
-            'firephone': '**PRODUCT**',
-            'jeffbezos': '**MEMBER**'
-        }
     }
 
 
@@ -386,7 +445,7 @@ if __name__ == "__main__":
 
 if __name__ == "__main__":
 
-    save_headlines(headlines, kword_replacements)
+    save_headlines(headlines)
 
 
 # In[8]:
@@ -394,9 +453,10 @@ if __name__ == "__main__":
 
 if __name__ == "__main__":
     
-    consume_ticker_csv('AAPL', 'AAPL.csv')
-    consume_ticker_csv('AMZN', 'AMZN.csv')
-    consume_ticker_csv('AMD', 'AMD.csv')
-    consume_ticker_csv('GOOG', 'GOOG.csv')
-    consume_ticker_csv('MSFT', 'MSFT.csv')
+    dl_ticker('AAPL')
+    dl_ticker('AMZN')
+    dl_ticker('AMD')
+    dl_ticker('GOOG')
+    dl_ticker('MSFT')
+    dl_ticker('INTC')
 
